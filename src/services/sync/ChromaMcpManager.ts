@@ -9,8 +9,9 @@ import os from 'os';
 import fs from 'fs';
 import { randomUUID } from 'crypto';
 import { logger } from '../../utils/logger.js';
-import { resolveBoundedNumber } from '../../shared/bounded-setting.js';
-import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
+import { parseBoundedNumber, resolveBoundedNumber } from '../../shared/bounded-setting.js';
+import { HOOK_TIMEOUTS, getTimeout } from '../../shared/hook-constants.js';
+import { SettingsDefaultsManager, type SettingsDefaults } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH, paths } from '../../shared/paths.js';
 import { getUvxBinDirs } from '../../shared/uvx-bin-dirs.js';
 import { killProcessTree, collectDescendantIdentities } from '../../shared/kill-process-tree.js';
@@ -37,6 +38,58 @@ const CHROMA_PROCESS_NICE_BOUNDS = { min: 0, max: 19, integer: true } as const;
 const CHROMA_PREWARM_TIMEOUT_BOUNDS = { min: 1, max: 600_000, integer: true } as const;
 const DEFAULT_CHROMA_MUTATION_TIMEOUT_MS = 600_000;
 const CHROMA_MUTATION_TIMEOUT_BOUNDS = { min: 60_000, max: 3_600_000 } as const;
+// Same window as getWorkerApiRequestTimeoutMs. Duplicated here so the chroma
+// manager does not import worker-utils (that module pulls in the worker
+// spawner, and the manager is already on the worker's import path).
+const API_REQUEST_TIMEOUT_SETTING = 'CLAUDE_MEM_API_TIMEOUT_MS';
+const API_REQUEST_TIMEOUT_BOUNDS = { min: 500, max: 300_000, integer: true } as const;
+const CHROMA_QUERY_TIMEOUT_SETTING = 'CLAUDE_MEM_CHROMA_QUERY_TIMEOUT_MS';
+// 10s under the default 30s worker budget, which is the 20s read deadline.
+// On a shorter budget the margin shrinks to a third so a 10s API timeout is
+// not paired with a 20s query that outlives /api/search.
+const CHROMA_QUERY_TIMEOUT_MARGIN_MS = 10_000;
+const MIN_CHROMA_QUERY_TIMEOUT_MS = 100;
+const CHROMA_QUERY_TIMEOUT_BOUNDS = { min: MIN_CHROMA_QUERY_TIMEOUT_MS, max: 300_000, integer: true } as const;
+const CHROMA_READ_DURATION_TOOLS = new Set(['chroma_query_documents', 'chroma_get_documents']);
+
+function settingText(raw: unknown): string {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return String(raw);
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+/**
+ * Read/query deadline that still leaves room for the FTS5 fallback inside the
+ * worker API budget. The default 30s budget yields 20s. A 10s budget yields
+ * 6667ms and a 60s budget yields 50s, so neither is stuck on a hard-coded 20s.
+ */
+function chromaQueryTimeoutBudgetMs(apiTimeoutMs: number): number {
+  const margin = Math.min(CHROMA_QUERY_TIMEOUT_MARGIN_MS, Math.floor(apiTimeoutMs / 3));
+  return Math.max(MIN_CHROMA_QUERY_TIMEOUT_MS, apiTimeoutMs - margin);
+}
+
+function resolveChromaQueryTimeoutMs(settings: SettingsDefaults): number {
+  const apiTimeoutMs = resolveBoundedNumber(
+    'CHROMA_MCP',
+    API_REQUEST_TIMEOUT_SETTING,
+    settings.CLAUDE_MEM_API_TIMEOUT_MS,
+    API_REQUEST_TIMEOUT_BOUNDS,
+    getTimeout(HOOK_TIMEOUTS.API_REQUEST),
+  );
+  const budget = chromaQueryTimeoutBudgetMs(apiTimeoutMs);
+  const raw = settings.CLAUDE_MEM_CHROMA_QUERY_TIMEOUT_MS;
+  if (settingText(raw) === '') return budget;
+  const configured = parseBoundedNumber(raw, { ...CHROMA_QUERY_TIMEOUT_BOUNDS, max: budget });
+  if (configured === null) {
+    logger.warn('CHROMA_MCP', `Invalid ${CHROMA_QUERY_TIMEOUT_SETTING}, using the API-budget deadline`, {
+      value: raw,
+      min: CHROMA_QUERY_TIMEOUT_BOUNDS.min,
+      max: budget,
+    });
+    return budget;
+  }
+  return configured;
+}
+
 const CHROMA_PREWARM_REAP_TIMEOUT_MS = 1_000;
 // Circuit breaker for a doomed prewarm (#4108). A broken host (missing uv, an
 // unresolvable dep, an NTFS hardlink ceiling) fails the same way every time, so
@@ -300,11 +353,22 @@ export class ChromaMcpManager {
    * The transport on which a write outlived its deadline. chroma-mcp runs one
    * request at a time (its tools call the blocking Chroma client), so that
    * write may still be committing until chroma-mcp answers anything else on
-   * the same transport; until then a read timeout never restarts it.
+   * the same transport. A read timeout on that transport is remembered and
+   * the subprocess is restarted only after an answer shows the write finished.
    */
   private timedOutWriteTransport: unknown = null;
+  /**
+   * A read timed out on this transport while a write was, or might still be,
+   * committing. The cancelled request poisons chroma-mcp's stdin
+   * (anyio.BrokenResourceError on the next message). The subprocess is
+   * restarted once that write has settled — no mutation still in flight, and
+   * no timed-out write still waiting for an answer — and before another call
+   * writes to it. It is not tree-killed mid-commit.
+   */
+  private readTimeoutRestart: { transport: unknown; toolName: string } | null = null;
   private readonly maxPendingMutationCalls: number;
   private readonly mutationTimeoutMs: number;
+  private readonly queryTimeoutMs: number;
   private readonly serializeMutations: boolean;
   private acceptingLocalMutations = true;
   private chromaCrashCount = 0;
@@ -327,6 +391,7 @@ export class ChromaMcpManager {
           Math.max(CHROMA_MUTATION_TIMEOUT_BOUNDS.min, configuredMutationTimeout)
         )
       : DEFAULT_CHROMA_MUTATION_TIMEOUT_MS;
+    this.queryTimeoutMs = resolveChromaQueryTimeoutMs(settings);
     this.serializeMutations = (settings.CLAUDE_MEM_CHROMA_MODE || 'local') !== 'remote';
   }
 
@@ -1450,6 +1515,9 @@ export class ChromaMcpManager {
   }
 
   private async callToolUnqueued(toolName: string, toolArguments: Record<string, unknown>): Promise<unknown> {
+    // A previous read already cancelled its request. Restart first when that
+    // is safe, and do not write another message while a commit is still open.
+    await this.prepareTransportAfterReadTimeout(toolName);
     const callGeneration = this.connectionGeneration;
     await this.ensureConnected();
     const callTransport = this.transport;
@@ -1460,21 +1528,25 @@ export class ChromaMcpManager {
     // that deadline as a request failure, and tearing chroma-mcp down while
     // SQLite/FTS5 may still be committing can leave the persistent index
     // malformed (a timeout is therefore never handled as a transport error,
-    // see below). Give mutations a bounded, configurable deadline while
-    // keeping read/query latency at the SDK default.
-    const requestOptions = isMutation
-      ? { timeout: this.mutationTimeoutMs }
-      : undefined;
+    // see below). Give mutations a bounded, configurable deadline.
+    // Reads must finish inside the worker /api/search budget
+    // (CLAUDE_MEM_API_TIMEOUT_MS, 30s by default) so the FTS5 fallback still
+    // runs. The SDK's 60s default is past that budget: /api/search failed at
+    // 30s while chroma-mcp kept the cancelled request (#6323).
+    const requestOptions = {
+      timeout: isMutation ? this.mutationTimeoutMs : this.queryTimeoutMs,
+    };
 
     logger.debug('CHROMA_MCP', `Calling tool: ${toolName}`, {
       arguments: JSON.stringify(toolArguments).slice(0, 200),
-      ...(requestOptions ? { timeoutMs: requestOptions.timeout } : {})
+      timeoutMs: requestOptions.timeout,
     });
 
     let result;
     if (isMutation) {
       this.mutationCallsInFlight += 1;
     }
+    const startedAt = Date.now();
     try {
       result = await this.client!.callTool({
         name: toolName,
@@ -1490,8 +1562,14 @@ export class ChromaMcpManager {
         if (isMutation) {
           this.timedOutWriteTransport = callTransport;
         } else if (this.mutationCallsInFlight === 0 && this.timedOutWriteTransport !== callTransport) {
+          this.readTimeoutRestart = null;
           await this.restartHungSubprocess(toolName, callTransport);
           throw new ChromaUnavailableError(`chroma-mcp did not answer "${toolName}" in time and was restarted`, cause);
+        } else {
+          // The cancelled read poisons stdin. Remember the transport and
+          // restart as soon as the write settles, instead of leaving
+          // chroma-mcp up until BrokenResourceError takes the next batch.
+          this.readTimeoutRestart = { transport: callTransport, toolName };
         }
         // A request that outlived its deadline while a write is, or may still
         // be, in flight means chroma-mcp is slow, not gone: the SDK has already
@@ -1501,7 +1579,8 @@ export class ChromaMcpManager {
         // The caller keeps the row pending.
         const message = `chroma-mcp "${toolName}" timed out; the subprocess was left running`;
         logger.warn('CHROMA_MCP', message, {
-          timeoutMs: requestOptions?.timeout,
+          timeoutMs: requestOptions.timeout,
+          restartWhenWriteSettles: this.readTimeoutRestart?.transport === callTransport,
           error: transportError instanceof Error ? transportError.message : String(transportError)
         });
         throw new ChromaUnavailableError(message, cause);
@@ -1547,6 +1626,14 @@ export class ChromaMcpManager {
       if (isMutation) {
         this.mutationCallsInFlight -= 1;
       }
+      await this.restartAfterReadTimeoutIfSafe();
+    }
+
+    if (!result.isError && CHROMA_READ_DURATION_TOOLS.has(toolName)) {
+      logger.debug('CHROMA_MCP', 'chroma-mcp read completed', {
+        toolName,
+        durationMs: Date.now() - startedAt,
+      });
     }
 
     if (result.isError) {
@@ -1618,7 +1705,65 @@ export class ChromaMcpManager {
   }
 
   /**
-   * A read outlived the SDK's deadline while no write was in flight or still
+   * True when no write is in flight and no timed-out write is still possibly
+   * committing on this transport. Restarting then cannot cut a commit.
+   */
+  private readTimeoutRestartIsSafe(transport: unknown): boolean {
+    return this.mutationCallsInFlight === 0 && this.timedOutWriteTransport !== transport;
+  }
+
+  /**
+   * Before sending, restart a chroma-mcp whose stdin a timed-out read already
+   * cancelled, once that is safe. While a mutation is still in flight, refuse
+   * the send instead of writing to that stdin. A timed-out write that has not
+   * yet answered is the one probe still allowed through: its answer is what
+   * shows the commit finished.
+   */
+  private async prepareTransportAfterReadTimeout(toolName: string): Promise<void> {
+    const pending = this.readTimeoutRestart;
+    if (!pending) return;
+    if (pending.transport !== this.transport) {
+      this.readTimeoutRestart = null;
+      return;
+    }
+    if (this.readTimeoutRestartIsSafe(pending.transport)) {
+      this.readTimeoutRestart = null;
+      await this.restartHungSubprocess(pending.toolName, pending.transport);
+      return;
+    }
+    if (this.mutationCallsInFlight > 0) {
+      throw new ChromaUnavailableError(
+        `chroma-mcp "${toolName}" was not sent; a read timed out and a write is still settling`
+      );
+    }
+  }
+
+  /**
+   * Restart the subprocess a timed-out read marked, now that every in-flight
+   * write has settled and chroma has answered any write that itself timed out.
+   * A failure here must not replace the call's own result or timeout error.
+   */
+  private async restartAfterReadTimeoutIfSafe(): Promise<void> {
+    const pending = this.readTimeoutRestart;
+    if (!pending) return;
+    if (pending.transport !== this.transport) {
+      this.readTimeoutRestart = null;
+      return;
+    }
+    if (!this.readTimeoutRestartIsSafe(pending.transport)) return;
+    this.readTimeoutRestart = null;
+    try {
+      await this.restartHungSubprocess(pending.toolName, pending.transport);
+    } catch (error) {
+      logger.warn('CHROMA_MCP', 'Restart after a timed-out chroma-mcp read did not finish', {
+        toolName: pending.toolName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * A read outlived its deadline while no write was in flight or still
    * possibly committing after its own deadline. Reads are short, so chroma-mcp
    * is hung rather than busy, and left running it makes every later read wait
    * out the same deadline. Take it down so the

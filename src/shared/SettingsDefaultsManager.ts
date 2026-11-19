@@ -373,6 +373,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CHROMA_DATABASE: string;
   CLAUDE_MEM_CHROMA_PREWARM_TIMEOUT_MS: string;
   CLAUDE_MEM_CHROMA_MUTATION_TIMEOUT_MS: string;
+  CLAUDE_MEM_CHROMA_QUERY_TIMEOUT_MS: string; // '' = under the worker API timeout, leaving room for the FTS5 fallback
   CLAUDE_MEM_CHROMA_MAX_PENDING_MUTATIONS: string;
   CLAUDE_MEM_CHROMA_BACKFILL_PAUSE_RATIO: string; // bulk backfill sleeps write-time x ratio per row; 0 = off, 0-10
   CLAUDE_MEM_CHROMA_PROCESS_NICE: string;         // niceness for chroma-mcp (non-Windows, needs `nice`); 0 = off, 0-19
@@ -704,6 +705,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_CHROMA_DATABASE: 'default_database',
     CLAUDE_MEM_CHROMA_PREWARM_TIMEOUT_MS: '120000',
     CLAUDE_MEM_CHROMA_MUTATION_TIMEOUT_MS: '600000', // Chroma embedding/index writes can exceed the MCP SDK's 60s default
+    CLAUDE_MEM_CHROMA_QUERY_TIMEOUT_MS: '',          // Empty = finish reads inside CLAUDE_MEM_API_TIMEOUT_MS with time left for the FTS5 fallback (20s when the API timeout is 30s)
     CLAUDE_MEM_CHROMA_MAX_PENDING_MUTATIONS: '5000', // Bound burst imports without changing normal live indexing
     CLAUDE_MEM_CHROMA_BACKFILL_PAUSE_RATIO: '1',     // Bulk backfill sleeps (row write time x ratio) after each row: 1 = at most ~50% duty, 0 = off, max 10. Live sync is never paced
     CLAUDE_MEM_CHROMA_PROCESS_NICE: '10',            // chroma-mcp starts as `nice -n N uvx ...` where `nice` exists (not Windows). 0 = off, max 19

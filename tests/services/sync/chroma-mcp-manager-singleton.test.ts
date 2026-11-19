@@ -617,7 +617,7 @@ describe('ChromaMcpManager singleton enforcement (#2313)', () => {
     expect(maxActiveMutations).toBe(1);
   });
 
-  it('extends only mutation request timeouts and honors the configured bound', async () => {
+  it('gives mutations their configured timeout and reads an explicit timeout under the API budget', async () => {
     mockedSettings = {
       CLAUDE_MEM_CHROMA_MUTATION_TIMEOUT_MS: '900000',
     };
@@ -630,11 +630,65 @@ describe('ChromaMcpManager singleton enforcement (#2313)', () => {
 
     await mgr.callTool('chroma_add_documents', { ids: ['one'] });
     await mgr.callTool('chroma_query_documents', { query_texts: ['fast read'] });
+    await mgr.callTool('chroma_get_documents', { ids: ['a'] });
+    await mgr.callTool('chroma_list_collections', { limit: 1 });
 
+    // Default worker API budget is 30s, so reads get 20s and the FTS5 fallback
+    // still fits. Mutations keep the configured bound.
     expect(calls).toEqual([
       { name: 'chroma_add_documents', timeout: 900000 },
-      { name: 'chroma_query_documents', timeout: undefined },
+      { name: 'chroma_query_documents', timeout: 20000 },
+      { name: 'chroma_get_documents', timeout: 20000 },
+      { name: 'chroma_list_collections', timeout: 20000 },
     ]);
+    const completed = logEntries.filter(entry => entry.message === 'chroma-mcp read completed');
+    expect(completed.map(entry => entry.meta?.toolName)).toEqual([
+      'chroma_query_documents',
+      'chroma_get_documents',
+    ]);
+    expect(completed.every(entry => typeof entry.meta?.durationMs === 'number')).toBe(true);
+  });
+
+  it('keeps the chroma read timeout inside a customized worker API budget', async () => {
+    const readTimeout = async (settings: Record<string, string>): Promise<number | undefined> => {
+      await ChromaMcpManager.reset();
+      resetState();
+      mockedSettings = settings;
+      const mgr = ChromaMcpManager.getInstance();
+      let timeout: number | undefined;
+      callToolImpl = async (_request, options) => {
+        timeout = options?.timeout;
+        return { content: [{ type: 'text', text: '{}' }] };
+      };
+      await mgr.callTool('chroma_query_documents', { query_texts: ['q'] });
+      return timeout;
+    };
+
+    // 10s API budget cannot keep a hard-coded 20s query: the margin shrinks
+    // to a third (10000 - floor(10000 / 3)).
+    expect(await readTimeout({ CLAUDE_MEM_API_TIMEOUT_MS: '10000' })).toBe(6_667);
+    // 60s API budget is not stuck at 20s; 10s stays free for the fallback.
+    expect(await readTimeout({ CLAUDE_MEM_API_TIMEOUT_MS: '60000' })).toBe(50_000);
+    // An explicit query timeout is honored when it fits, and clamped when it
+    // would outlive the worker's search deadline.
+    expect(await readTimeout({ CLAUDE_MEM_CHROMA_QUERY_TIMEOUT_MS: '8000' })).toBe(8_000);
+    expect(await readTimeout({ CLAUDE_MEM_CHROMA_QUERY_TIMEOUT_MS: '25000' })).toBe(20_000);
+    expect(await readTimeout({
+      CLAUDE_MEM_API_TIMEOUT_MS: '60000',
+      CLAUDE_MEM_CHROMA_QUERY_TIMEOUT_MS: '40000',
+    })).toBe(40_000);
+    // Mutations do not pick up the read deadline.
+    await ChromaMcpManager.reset();
+    resetState();
+    mockedSettings = { CLAUDE_MEM_API_TIMEOUT_MS: '10000' };
+    const mgr = ChromaMcpManager.getInstance();
+    let mutationTimeout: number | undefined;
+    callToolImpl = async (_request, options) => {
+      mutationTimeout = options?.timeout;
+      return { content: [{ type: 'text', text: '{}' }] };
+    };
+    await mgr.callTool('chroma_add_documents', { ids: ['one'] });
+    expect(mutationTimeout).toBe(600_000);
   });
 
   it('leaves chroma-mcp running when a slow mutation times out instead of tree-killing it mid-commit', async () => {
@@ -710,6 +764,75 @@ describe('ChromaMcpManager singleton enforcement (#2313)', () => {
     writeReleases[0]();
     await expect(write).resolves.toEqual({});
     expect(transportInstances.length).toBe(1);
+  });
+
+  it('restarts chroma-mcp once an in-flight write settles after a read timeout', async () => {
+    const mgr = ChromaMcpManager.getInstance();
+    await mgr.callTool('chroma_list_collections', { limit: 1 });
+    killProcessTreeCalls.length = 0;
+
+    const writeReleases: Array<() => void> = [];
+    let sends = 0;
+    callToolImpl = async request => {
+      sends += 1;
+      if (request?.name === 'chroma_add_documents') {
+        await new Promise<void>(resolve => writeReleases.push(resolve));
+        return { content: [{ type: 'text', text: '{}' }] };
+      }
+      throw new McpError(ErrorCode.RequestTimeout, 'Request timed out', { timeout: 20000 });
+    };
+
+    const write = mgr.callTool('chroma_add_documents', { ids: ['committing'] });
+    await waitForCondition(() => writeReleases.length === 1);
+    await expect(mgr.callTool('chroma_query_documents', { query_texts: ['slow'] })).rejects.toBeInstanceOf(ChromaUnavailableError);
+
+    // The commit is still open: do not dispose, and do not send another
+    // message at the cancelled stdin.
+    expect(transportInstances[0].closed).toBe(false);
+    expect(killProcessTreeCalls).toEqual([]);
+    const sendsBeforeRefusedCall = sends;
+    await expect(mgr.callTool('chroma_list_collections', { limit: 1 })).rejects.toThrow('was not sent');
+    expect(sends).toBe(sendsBeforeRefusedCall);
+
+    writeReleases[0]();
+    await expect(write).resolves.toEqual({});
+    expect(transportInstances[0].closed).toBe(true);
+
+    callToolImpl = async () => ({ content: [{ type: 'text', text: '{}' }] });
+    await mgr.callTool('chroma_add_documents', { ids: ['next'] });
+    expect(transportInstances.length).toBe(2);
+    expect(transportInstances[1].closed).toBe(false);
+  });
+
+  it('restarts after a read timeout once a timed-out write has answered, not while it may be committing', async () => {
+    const mgr = ChromaMcpManager.getInstance();
+    await mgr.callTool('chroma_list_collections', { limit: 1 });
+
+    let answering = false;
+    callToolImpl = async request => {
+      if (request?.name === 'chroma_list_collections' && answering) {
+        return { content: [{ type: 'text', text: '[]' }] };
+      }
+      throw new McpError(ErrorCode.RequestTimeout, 'Request timed out', { timeout: 20000 });
+    };
+
+    await expect(mgr.callTool('chroma_add_documents', { ids: ['slow'] })).rejects.toBeInstanceOf(ChromaUnavailableError);
+    await expect(mgr.callTool('chroma_query_documents', { query_texts: ['queued'] })).rejects.toBeInstanceOf(ChromaUnavailableError);
+    expect(transportInstances[0].closed).toBe(false);
+    expect(logEntries.some(entry =>
+      entry.message === 'chroma-mcp "chroma_add_documents" timed out; the subprocess was left running'
+    )).toBe(true);
+
+    // The answering call is the probe that the commit finished. Restart
+    // happens as that call returns, before the next send.
+    answering = true;
+    await mgr.callTool('chroma_list_collections', { limit: 1 });
+    expect(transportInstances[0].closed).toBe(true);
+
+    callToolImpl = async () => ({ content: [{ type: 'text', text: '{}' }] });
+    await mgr.callTool('chroma_get_documents', { ids: ['next'] });
+    expect(transportInstances.length).toBe(2);
+    expect(transportInstances[1].closed).toBe(false);
   });
 
   it('never restarts chroma-mcp while a write that timed out may still be committing', async () => {

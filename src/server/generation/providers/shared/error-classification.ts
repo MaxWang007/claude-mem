@@ -103,16 +103,56 @@ interface ClassifyHttpInput {
 }
 
 /**
+ * litellm parse failures and retired-model replies inside a 200 body. Shared
+ * with the worker's OpenRouter classifier (#6447): promoting either into a
+ * retry resends billed work, or retries a model id that is gone. Gemini's
+ * other 200 envelopes do not carry these words.
+ */
+const OUTPUT_FAILURE_MARKERS = ['unable to get json', 'expecting value'];
+const MODEL_GONE_MARKERS = [
+  'model has been deprecated',
+  'not a valid model id',
+  'no endpoints found for',
+];
+
+/** `error.code` when the body is a JSON error envelope, else undefined. */
+function numericEnvelopeCode(body: string): number | undefined {
+  if (!body.trimStart().startsWith('{')) return undefined;
+  try {
+    const parsed = JSON.parse(body) as { error?: { code?: unknown } };
+    const code = parsed?.error && typeof parsed.error === 'object' ? parsed.error.code : undefined;
+    return typeof code === 'number' && Number.isInteger(code) ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Status to classify by. OpenRouter accepts the request, then may send the
+ * real failure in a 200 body; `error.code` is that status (429, 503, 529).
+ * The worker's classifyOpenRouterError applies the same rule (#6447).
+ */
+function httpStatusFromEnvelope(httpStatus: number | undefined, body: string, lower: string): number | undefined {
+  if (httpStatus === undefined || httpStatus < 200 || httpStatus >= 300) return httpStatus;
+  if (OUTPUT_FAILURE_MARKERS.some(marker => lower.includes(marker))) return httpStatus;
+  if (MODEL_GONE_MARKERS.some(marker => lower.includes(marker))) return httpStatus;
+  const code = numericEnvelopeCode(body);
+  if (code !== undefined && code >= 400 && code < 600) return code;
+  return httpStatus;
+}
+
+/**
  * Generic HTTP-error → ServerClassifiedProviderError mapping shared by
  * Gemini and OpenRouter server adapters. Provider-specific overrides (e.g.
  * Anthropic OverloadedError, Gemini quota body markers) are layered on top
  * by the per-provider classifier wrappers in this module.
  */
 export function classifyHttpProviderError(input: ClassifyHttpInput): ServerClassifiedProviderError {
-  const { status, providerLabel } = input;
+  const { providerLabel } = input;
   const body = input.bodyText ?? '';
   const lower = body.toLowerCase();
   const retryAfterMs = input.headers ? parseRetryAfterMs(input.headers.get('retry-after')) : undefined;
+  const status = httpStatusFromEnvelope(input.status, body, lower);
   const cause = status === undefined
     ? input.cause
     : new Error(`${providerLabel} HTTP error (status ${status})`);
@@ -188,11 +228,27 @@ export function classifyHttpProviderError(input: ClassifyHttpInput): ServerClass
   // failure, never retried ("never pay twice"). Kept marker-scoped so it keeps
   // its own words: this classifier is shared with Gemini, whose other 200
   // envelopes (FAILED_PRECONDITION, etc.) fall through to unrecoverable below.
-  if (lower.includes('unable to get json') || lower.includes('expecting value')) {
+  if (OUTPUT_FAILURE_MARKERS.some(marker => lower.includes(marker))) {
     return new ServerClassifiedProviderError(
       `${providerLabel} upstream output failure (status ${status})`,
       { kind: 'unrecoverable', paidSendOutcome: 'output_failure', cause },
     );
+  }
+
+  // Prose form of the same 200-body failures, when no numeric code was sent.
+  // A throttle retries like a 429; peak capacity pauses like a 5xx (#6447).
+  if (lower.includes('temporarily rate-limited upstream')) {
+    return new ServerClassifiedProviderError(`${providerLabel} rate limit (status ${status})`, {
+      kind: 'rate_limit',
+      cause,
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+    });
+  }
+  if (lower.includes('high demand') || lower.includes('peak load')) {
+    return new ServerClassifiedProviderError(`${providerLabel} upstream error (status ${status})`, {
+      kind: 'transient',
+      cause,
+    });
   }
 
   return new ServerClassifiedProviderError(

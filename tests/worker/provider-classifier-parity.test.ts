@@ -67,6 +67,69 @@ describe('worker and server agree on provider refusals', () => {
     });
   }
 
+  // #6447: OpenRouter delivers the real status in a 200 body's error.code.
+  // The worker and the server runtime have to agree, or one pauses and the
+  // other finalizes the same answer.
+  const rateLimitedUpstream = 'openai/gpt-6-luna is temporarily rate-limited upstream.';
+  const highDemand = 'The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load. For improved capacity reliability, consider switching to Provisioned Throughput.';
+
+  function openRouterKinds(bodyText: string): { worker: string; server: string } {
+    const cause = new Error('200');
+    return {
+      worker: classifyOpenRouterError({ status: 200, bodyText, cause }).kind,
+      server: classifyHttpProviderError({ status: 200, bodyText, cause, providerLabel: 'OpenRouter' }).kind,
+    };
+  }
+
+  it('OpenRouter 200 with numeric error.code 429 is rate_limit on both, and on openai-compatible', () => {
+    const bodyText = JSON.stringify({ error: { code: 429, message: rateLimitedUpstream } });
+    const kinds = openRouterKinds(bodyText);
+    expect(kinds.worker).toBe('rate_limit');
+    expect(kinds.server).toBe(kinds.worker);
+    expect(classifyOpenAICompatError({ status: 200, bodyText, cause: new Error('200') }).kind).toBe('rate_limit');
+  });
+
+  it.each([503, 529])('OpenRouter 200 with numeric error.code %i and a peak-load message is transient on both', (code) => {
+    const bodyText = JSON.stringify({ error: { code, message: highDemand } });
+    const kinds = openRouterKinds(bodyText);
+    expect(kinds.worker).toBe('transient');
+    expect(kinds.server).toBe(kinds.worker);
+    expect(classifyOpenAICompatError({ status: 200, bodyText, cause: new Error('200') }).kind).toBe('transient');
+  });
+
+  it('OpenRouter capacity phrases with no numeric code are retryable on both', () => {
+    const rateLimited = openRouterKinds(JSON.stringify({ error: { message: rateLimitedUpstream } }));
+    expect(rateLimited.worker).toBe('rate_limit');
+    expect(rateLimited.server).toBe(rateLimited.worker);
+
+    const demand = openRouterKinds(highDemand);
+    expect(demand.worker).toBe('transient');
+    expect(demand.server).toBe(demand.worker);
+  });
+
+  it('a litellm parse failure inside a 200 envelope stays an output failure on both', () => {
+    const bodyText = JSON.stringify({
+      error: { code: 200, message: 'Unable to get json response - Expecting value: line 45 column 1 (char 44)' },
+    });
+    const cause = new Error('200');
+    const worker = classifyOpenRouterError({ status: 200, bodyText, cause });
+    const server = classifyHttpProviderError({ status: 200, bodyText, cause, providerLabel: 'OpenRouter' });
+    expect(worker.kind).toBe('unrecoverable');
+    expect(worker.paidSendOutcome).toBe('output_failure');
+    expect(server.kind).toBe(worker.kind);
+    expect(server.paidSendOutcome).toBe('output_failure');
+  });
+
+  it('a model deprecation inside a 200 envelope stays unrecoverable on both', () => {
+    const bodyText = JSON.stringify({ error: { code: 404, message: 'This model has been deprecated' } });
+    const cause = new Error('200');
+    const worker = classifyOpenRouterError({ status: 200, bodyText, cause });
+    const server = classifyHttpProviderError({ status: 200, bodyText, cause, providerLabel: 'OpenRouter' });
+    expect(worker.kind).toBe('unrecoverable');
+    expect(worker.code).toBe('model_unavailable');
+    expect(server.kind).toBe('unrecoverable');
+  });
+
   it('Gemini 400 refusing the key is a refused credential on both', () => {
     const bodyText = JSON.stringify({
       error: {

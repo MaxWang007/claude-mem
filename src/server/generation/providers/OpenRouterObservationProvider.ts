@@ -228,9 +228,11 @@ export class OpenRouterObservationProvider implements ServerGenerationProvider {
     }
 
     if (data.error) {
+      // Keep the envelope. A 200 from OpenRouter carries the real status in
+      // error.code; a flattened "code message" string drops it (#6447).
       throw classifyHttpProviderError({
         status: response.status,
-        bodyText: `${data.error.code ?? ''} ${data.error.message ?? ''}`,
+        bodyText: JSON.stringify({ error: { code: data.error.code, message: data.error.message } }),
         headers: response.headers,
         cause: new Error(`OpenRouter API error: ${data.error.code} - ${data.error.message}`),
         providerLabel: 'OpenRouter',

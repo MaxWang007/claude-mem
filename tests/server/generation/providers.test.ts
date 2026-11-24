@@ -742,6 +742,41 @@ describe('OpenRouterObservationProvider', () => {
     }
   });
 
+  it('classifies a 200 body with numeric error.code 429 as rate_limit', async () => {
+    const provider = new OpenRouterObservationProvider({
+      apiKey: 'fake',
+      fetchImpl: async () => jsonResponse(200, {
+        error: { code: 429, message: 'openai/gpt-6-luna is temporarily rate-limited upstream.' },
+      }),
+    });
+    try {
+      await provider.generate(makeContext());
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ServerClassifiedProviderError);
+      expect((error as ServerClassifiedProviderError).kind).toBe('rate_limit');
+    }
+  });
+
+  it('classifies a 200 body with numeric error.code 503 as transient', async () => {
+    const provider = new OpenRouterObservationProvider({
+      apiKey: 'fake',
+      fetchImpl: async () => jsonResponse(200, {
+        error: {
+          code: 503,
+          message: 'The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load.',
+        },
+      }),
+    });
+    try {
+      await provider.generate(makeContext());
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ServerClassifiedProviderError);
+      expect((error as ServerClassifiedProviderError).kind).toBe('transient');
+    }
+  });
+
   // #2382/#2590/#2622/#2393 — configurable OpenAI-compatible base URL.
   for (const [baseUrl, expectedUrl] of [
     [undefined, 'https://openrouter.ai/api/v1/chat/completions'],

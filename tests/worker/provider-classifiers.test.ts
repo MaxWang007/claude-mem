@@ -650,6 +650,85 @@ describe('classifyOpenRouterError', () => {
     expect(err.kind).toBe('unrecoverable');
     expect(err.message).toBe('OpenRouter bad request (status 400): model is required');
   });
+
+  // OpenRouter accepts the request, then sends the real failure in a 200 body.
+  // error.code is that status (#6447). The two messages below are from the report.
+  const rateLimitedUpstream = 'openai/gpt-6-luna is temporarily rate-limited upstream.';
+  const highDemand = 'The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load. For improved capacity reliability, consider switching to Provisioned Throughput.';
+
+  it('classifies a 200 envelope with numeric error.code 429 as rate_limit', () => {
+    const err = classifyOpenRouterError({
+      status: 200,
+      bodyText: JSON.stringify({ error: { code: 429, message: rateLimitedUpstream } }),
+      headers: new Headers({ 'retry-after': '8' }),
+      cause: new Error('200'),
+    });
+    expect(err.kind).toBe('rate_limit');
+    expect(err.retryAfterMs).toBe(8_000);
+    expect(err.message).toBe(`OpenRouter rate limit (status 429): ${rateLimitedUpstream}`);
+  });
+
+  it.each([503, 529])('classifies a 200 envelope with numeric error.code %i and a peak-load message as transient', (code) => {
+    const err = classifyOpenRouterError({
+      status: 200,
+      bodyText: JSON.stringify({ error: { code, message: highDemand } }),
+      cause: new Error('200'),
+    });
+    expect(err.kind).toBe('transient');
+    expect(err.message).toBe(`OpenRouter upstream error (status ${code}): ${highDemand}`);
+  });
+
+  it('classifies the same phrases as retryable when the 200 body has no numeric code', () => {
+    const rateLimited = classifyOpenRouterError({
+      status: 200,
+      bodyText: JSON.stringify({ error: { message: rateLimitedUpstream } }),
+      cause: new Error('200'),
+    });
+    expect(rateLimited.kind).toBe('rate_limit');
+    expect(rateLimited.message).toContain(rateLimitedUpstream);
+
+    const demand = classifyOpenRouterError({
+      status: 200,
+      bodyText: highDemand,
+      cause: new Error('200'),
+    });
+    expect(demand.kind).toBe('transient');
+    expect(demand.message).toContain('peak load');
+  });
+
+  it('still classifies other numeric codes inside a 200 envelope by that code', () => {
+    expect(classifyOpenRouterError({
+      status: 200,
+      bodyText: JSON.stringify({ error: { code: 401, message: 'User not found.' } }),
+      cause: new Error('200'),
+    }).kind).toBe('auth_invalid');
+    expect(classifyOpenRouterError({
+      status: 200,
+      bodyText: JSON.stringify({ error: { code: 402, message: 'Payment required' } }),
+      cause: new Error('200'),
+    }).kind).toBe('quota_exhausted');
+  });
+
+  it('keeps a litellm parse failure inside a 200 envelope an output failure', () => {
+    const message = 'Unable to get json response - Expecting value: line 45 column 1 (char 44)';
+    const err = classifyOpenRouterError({
+      status: 200,
+      bodyText: JSON.stringify({ error: { code: 200, message } }),
+      cause: new Error('200'),
+    });
+    expect(err.kind).toBe('unrecoverable');
+    expect(err.paidSendOutcome).toBe('output_failure');
+  });
+
+  it('keeps a model deprecation inside a 200 envelope model_unavailable', () => {
+    const err = classifyOpenRouterError({
+      status: 200,
+      bodyText: JSON.stringify({ error: { message: 'This model has been deprecated', code: 404 } }),
+      cause: new Error('200'),
+    });
+    expect(err.kind).toBe('unrecoverable');
+    expect(err.code).toBe('model_unavailable');
+  });
 });
 
 describe('describeProviderError', () => {

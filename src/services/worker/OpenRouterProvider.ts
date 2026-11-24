@@ -200,6 +200,40 @@ const MODEL_UNAVAILABLE_ACTION =
 const OPENROUTER_MODEL_LIST_URL = 'https://openrouter.ai/models';
 
 /**
+ * litellm (behind OpenRouter) reports a failure to parse the downstream
+ * model's reply inside a 200 envelope. The model ran and was billed, so this
+ * stays an output failure and is never promoted into a retry (#6447).
+ */
+const UPSTREAM_OUTPUT_FAILURE_MARKERS = ['unable to get json', 'expecting value'];
+
+function isUpstreamOutputFailureBody(lower: string): boolean {
+  return UPSTREAM_OUTPUT_FAILURE_MARKERS.some(marker => lower.includes(marker));
+}
+
+/**
+ * The status to classify by.
+ *
+ * OpenRouter accepts the request first, then may deliver the real failure in
+ * a 200 body as `{ error: { code, message } }`, where `code` is the HTTP
+ * status it would have returned (#6447). The same shape is what #5191 reads
+ * for an OpenAI-compatible gateway. A litellm parse failure and a retired
+ * model keep the classifications they already have: promoting either into a
+ * 429 or a 5xx would resend billed work, or retry a model id that is gone.
+ */
+function openRouterStatus(
+  httpStatus: number | undefined,
+  envelope: UpstreamErrorEnvelope | null,
+  lower: string,
+): number | undefined {
+  if (httpStatus === undefined || httpStatus < 200 || httpStatus >= 300 || envelope === null) return httpStatus;
+  if (isUpstreamOutputFailureBody(lower)) return httpStatus;
+  if (MODEL_UNAVAILABLE_MARKERS.some(marker => lower.includes(marker))) return httpStatus;
+  const code = envelope.code;
+  if (typeof code === 'number' && Number.isInteger(code) && code >= 400 && code < 600) return code;
+  return httpStatus;
+}
+
+/**
  * Machine-readable context-length refusals from OpenAI-compatible servers:
  * OpenAI's error code, and llama.cpp's error type and message. The prose forms
  * ("maximum context length", "prompt is too long", "reduce the length of the
@@ -230,7 +264,7 @@ export function classifyOpenRouterError(input: {
   /** The URL a request with no response was sent to, named in the network-error message. */
   requestUrl?: string;
 }): ClassifiedProviderError {
-  const status = input.status;
+  const httpStatus = input.status;
   const body = input.bodyText ?? '';
   const lower = body.toLowerCase();
   const headers = input.headers;
@@ -244,7 +278,7 @@ export function classifyOpenRouterError(input: {
     const kind = GATEWAY_CODE_TO_KIND[code];
     const message = typeof envelope.message === 'string' && envelope.message
       ? envelope.message
-      : `OpenRouter error ${code}${status !== undefined ? ` (status ${status})` : ''}`;
+      : `OpenRouter error ${code}${httpStatus !== undefined ? ` (status ${httpStatus})` : ''}`;
     const requestId = typeof envelope.request_id === 'string' && envelope.request_id
       ? envelope.request_id
       : input.requestId;
@@ -261,6 +295,10 @@ export function classifyOpenRouterError(input: {
       ...(kind === 'rate_limit' && gatewayRetryAfterMs !== undefined ? { retryAfterMs: gatewayRetryAfterMs } : {}),
     });
   }
+
+  // A 2xx envelope's numeric error.code is the real status. String gateway
+  // codes have already returned above, so this cannot reclassify those.
+  const status = openRouterStatus(httpStatus, envelope, lower);
 
   // Legacy classification: keep the upstream body in the message (it usually
   // contains the remedy, e.g. OpenRouter's "Key limit exceeded … Manage it
@@ -385,10 +423,26 @@ export function classifyOpenRouterError(input: {
   // only its output was lost. Resending pays for the same work again, so it is
   // an output failure and never retried ("never pay twice"). Kept
   // marker-scoped so it carries its own words in the log.
-  if (lower.includes('unable to get json') || lower.includes('expecting value')) {
+  if (isUpstreamOutputFailureBody(lower)) {
     return new ClassifiedProviderError(
       describe('upstream output failure'),
       { kind: 'unrecoverable', paidSendOutcome: 'output_failure', cause: input.cause, ...detail },
+    );
+  }
+
+  // The same two capacity failures, when the 200 body has no numeric code
+  // (#6447). A throttle is a 429; peak load is a 5xx. Either pauses the
+  // session instead of finalizing it and dropping the buffer.
+  if (lower.includes('temporarily rate-limited upstream')) {
+    return new ClassifiedProviderError(
+      describe('rate limit'),
+      { kind: 'rate_limit', cause: input.cause, ...detail, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
+    );
+  }
+  if (lower.includes('high demand') || lower.includes('peak load')) {
+    return new ClassifiedProviderError(
+      describe('upstream error'),
+      { kind: 'transient', cause: input.cause, ...detail },
     );
   }
 

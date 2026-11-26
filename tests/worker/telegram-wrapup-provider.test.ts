@@ -75,6 +75,56 @@ describe('Telegram wrap-up provider reuse', () => {
     const { options } = sdkQuery.mock.calls[0][0] as { options: Record<string, unknown> };
     expect(options.resume).toBeUndefined();
     expect(options.systemPrompt).toBeUndefined();
+    expect((options.env as Record<string, string>).CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('4096');
+    expect((options.env as Record<string, string>).PATH).toBe('/mock/bin');
+  });
+
+  it('caps a Claude standalone call at CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS, not a host CLI value', async () => {
+    settings.CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS = '2048';
+    const previous = process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+    process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = '128000';
+    try {
+      const provider = new ClaudeProvider({} as never, {} as never);
+      await provider.formatTelegramWrapup(input, 'active-summary-model');
+      const { options } = sdkQuery.mock.calls[0][0] as { options: { maxTurns?: number; env?: Record<string, string> } };
+      expect(options.maxTurns).toBe(1);
+      expect(options.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('2048');
+      expect(options.env?.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+      else process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = previous;
+    }
+  });
+
+  it('sends that same cap on a Claude field condense and keeps a finished reply', async () => {
+    settings.CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS = '1536';
+    sdkQuery.mockImplementationOnce(() => (async function* () {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'condensed payload' }], stop_reason: 'end_turn' } };
+      yield { type: 'result', subtype: 'success', is_error: false, result: 'condensed payload', stop_reason: 'end_turn' };
+    })());
+    const provider = new ClaudeProvider({} as never, {} as never);
+    const session = { ...input, abortController: new AbortController() };
+
+    await expect((provider as any).compressField(
+      'large field', 100, session, 'model', '/mock/claude', new AbortController().signal,
+    )).resolves.toEqual({ text: 'condensed payload', truncated: false });
+
+    const { options } = sdkQuery.mock.calls[0][0] as { options: { maxTurns?: number; env?: Record<string, string> } };
+    expect(options.maxTurns).toBe(1);
+    expect(options.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('1536');
+  });
+
+  it('reports a Claude condense cut off at the output cap as truncated', async () => {
+    sdkQuery.mockImplementationOnce(() => (async function* () {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'partial summary' }], stop_reason: null } };
+      yield { type: 'result', subtype: 'success', is_error: false, result: 'partial summary', stop_reason: 'max_tokens' };
+    })());
+    const provider = new ClaudeProvider({} as never, {} as never);
+    const session = { ...input, abortController: new AbortController() };
+
+    await expect((provider as any).compressField(
+      'large field', 100, session, 'model', '/mock/claude', new AbortController().signal,
+    )).resolves.toEqual({ text: 'partial summary', truncated: true });
   });
 
   it.each([true, false])('uses existing Claude summary settings for replay with tier routing %s', async enabled => {
@@ -222,6 +272,27 @@ describe('Telegram wrap-up provider reuse', () => {
 
     expect(result).toEqual(payload);
     expect(sdkQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to the original field when a Claude condense hits the output cap', async () => {
+    sdkQuery.mockImplementationOnce(() => (async function* () {
+      yield {
+        type: 'assistant',
+        error: 'max_output_tokens',
+        message: { content: [{ type: 'text', text: 'partial summary' }], stop_reason: 'max_tokens' },
+      };
+      yield { type: 'result', subtype: 'success', is_error: false, result: 'partial summary', stop_reason: 'max_tokens' };
+    })());
+    const provider = new ClaudeProvider({} as never, {} as never);
+    const payload = { file_path: '/project/report.txt', content: 'verified tool output '.repeat(2_000) };
+    const session = { ...input, abortController: new AbortController() };
+    const result = await optimizeField(payload, (text, budget, signal) =>
+      (provider as any).compressField(text, budget, session, 'model', '/mock/claude', signal),
+    { sessionDbId: input.sessionDbId, field: 'outcome' }, 1_000);
+
+    expect(result).toEqual(payload);
+    const { options } = sdkQuery.mock.calls[0][0] as { options: { env?: Record<string, string> } };
+    expect(options.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('4096');
   });
 
   it('rejects text from a standalone stream that never completes its result', async () => {

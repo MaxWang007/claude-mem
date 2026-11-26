@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { sanitizeEnv } from '../../src/supervisor/env-sanitizer.js';
+import { keepExplicitClaudeOutputCap, sanitizeEnv } from '../../src/supervisor/env-sanitizer.js';
 
 const KEPT = [
   ['PATH', '/usr/bin'],
@@ -54,6 +54,7 @@ const STRIPPED = [
   ['CLAUDE_CODE_ENTRYPOINT', 'entry'],
   ['MCP_SESSION_ID', 'mcp'],
   ['CLAUDE_CODE_EFFORT_LEVEL', 'high'],
+  ['CLAUDE_CODE_MAX_OUTPUT_TOKENS', '128000'],
   ['CLAUDE_CODE_RANDOM_OTHER', 'should-be-stripped'],
   ['CLAUDE_CODE_ENTRYPOINT', 'cli'],
   ['CLAUDE_CODE_ALWAYS_ENABLE_EFFORT', '1'],
@@ -84,5 +85,21 @@ describe('sanitizeEnv', () => {
 
   it('handles an empty env', () => {
     expect(sanitizeEnv({})).toEqual({});
+  });
+
+  it('keeps an output cap the caller set and does not recover a host one', () => {
+    const sanitized = sanitizeEnv({
+      PATH: '/usr/bin',
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+      CLAUDE_CODE_EFFORT_LEVEL: 'high',
+    });
+    expect(sanitized.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBeUndefined();
+    expect(keepExplicitClaudeOutputCap(sanitized, undefined).CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBeUndefined();
+
+    const capped = keepExplicitClaudeOutputCap(
+      sanitizeEnv({ PATH: '/usr/bin', CLAUDE_CODE_EFFORT_LEVEL: 'high' }),
+      { PATH: '/usr/bin', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '4096', CLAUDE_CODE_EFFORT_LEVEL: 'high' },
+    );
+    expect(capped).toEqual({ PATH: '/usr/bin', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '4096' });
   });
 });

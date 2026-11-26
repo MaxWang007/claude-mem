@@ -377,8 +377,11 @@ export const OBSERVER_MAX_OUTPUT_TOKENS_BOUNDS = { min: 256, max: 1_000_000 } as
 /**
  * The output-token cap every HTTP observer request sends (#3868): OpenRouter's
  * max_tokens, max_completion_tokens on the #4003 retry, and Gemini's
- * maxOutputTokens. A reasoning model can spend the fixed 4096 before it
- * answers, cutting replies off mid-tag; this makes the cap configurable.
+ * maxOutputTokens. Claude standalone observer calls use it too: the Agent SDK
+ * Options type has no max-output field, so that path sets the CLI's
+ * CLAUDE_CODE_MAX_OUTPUT_TOKENS (#6503). A reasoning model can spend the fixed
+ * 4096 before it answers, cutting replies off mid-tag; this makes the cap
+ * configurable.
  * Complete integers only; anything else keeps the default. Read per request,
  * so a settings change applies without a restart.
  */

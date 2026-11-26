@@ -345,7 +345,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS: string;
   CLAUDE_MEM_OBSERVER_THINKING: string;  // Observer thinking param: 'disabled' | 'adaptive' | 'enabled[:budget]' | 'omit' (#4732)
   CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW: string;  // Observer model context window in tokens; '' = resolve automatically
-  CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS: string;  // Output-token cap on every HTTP observer request (OpenRouter, custom, gateway, Gemini)
+  CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS: string;  // Output-token cap on HTTP observer requests and Claude standalone observer calls
   CLAUDE_MEM_OBSERVE_BARE_PROMPTS: string;  // 'true' sends a user prompt to the observer on its own; default 'false' carries it on the next tool event
   CLAUDE_MEM_HOOK_FAIL_LOUD_THRESHOLD: string;
   CLAUDE_MEM_REDACT_ENABLED: string;
@@ -687,7 +687,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS: '100000',
     CLAUDE_MEM_OBSERVER_THINKING: 'disabled',  // Observer thinking param: 'disabled' (shipped) | 'adaptive' | 'enabled[:budget]' | 'omit' — an always-thinking gateway upstream rejects 'disabled' with 400/1210 (#4732)
     CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW: '',  // Observer model context window in tokens; '' = resolve it (OpenRouter catalogue, Gemini/Claude maps). Lowers the budget above to half the window (#3625)
-    CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS: '4096',  // max_tokens / max_completion_tokens / Gemini maxOutputTokens on every HTTP observer request (#3868)
+    CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS: '4096',  // HTTP max_tokens / max_completion_tokens / Gemini maxOutputTokens, and the Claude standalone CLI cap (#3868, #6503)
     CLAUDE_MEM_OBSERVE_BARE_PROMPTS: 'false',  // 'true' restores one observer call per user prompt; 'false' carries the prompt on the next tool event's call
     CLAUDE_MEM_HOOK_FAIL_LOUD_THRESHOLD: '3',  // After N consecutive worker-unreachable hook invocations, show the worker-outage notice once per session (never blocks; plan-17)
     CLAUDE_MEM_REDACT_ENABLED: 'false',                   // Opt-in auto-redaction of common secret patterns (see docs/public/usage/auto-redaction.mdx)

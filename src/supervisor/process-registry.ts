@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'fs';
 import path from 'path';
 import { logger } from '../utils/logger.js';
 import { writeJsonFileAtomic } from '../shared/atomic-json.js';
-import { sanitizeEnv } from './env-sanitizer.js';
+import { keepExplicitClaudeOutputCap, sanitizeEnv } from './env-sanitizer.js';
 import { ensureDir, OBSERVER_SESSIONS_DIR, paths } from '../shared/paths.js';
 // Moved to shared/ so kill-process-tree.ts can use it without closing an
 // import cycle (process-registry already imports kill-process-tree). Re-exported
@@ -960,7 +960,7 @@ export function spawnSdkProcess(
   const registry = getProcessRegistry();
 
   const useCmdWrapper = process.platform === 'win32' && options.command.endsWith('.cmd');
-  const env = sanitizeEnv(options.env ?? process.env);
+  const env = keepExplicitClaudeOutputCap(sanitizeEnv(options.env ?? process.env), options.env);
   const filteredArgs = normalizeSpawnSdkArgs(options.args, options.extraArgs);
   const cwd = normalizeSpawnSdkCwd(sessionDbId);
   try {

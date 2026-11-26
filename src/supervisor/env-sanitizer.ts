@@ -77,6 +77,30 @@ export const ENV_PRESERVE = new Set([
   ...ENV_PROXY_VARS,
 ]);
 
+/**
+ * Claude Code reads this as the max output tokens of a request. The Agent SDK
+ * `Options` type has no max-output field. Host values stay stripped with the
+ * rest of `CLAUDE_CODE_*`; a caller that sets this on an already-sanitized
+ * env is naming the cap for that one child.
+ */
+export const CLAUDE_CODE_MAX_OUTPUT_TOKENS_ENV = 'CLAUDE_CODE_MAX_OUTPUT_TOKENS';
+
+/**
+ * Put back an output cap the caller set on this spawn's own env.
+ *
+ * `sanitizeEnv` removes it with every other `CLAUDE_CODE_*` host setting.
+ * Passing `options.env` (undefined when the spawn inherits `process.env`)
+ * keeps a cap this call assigned and does not recover one from the host.
+ */
+export function keepExplicitClaudeOutputCap(
+  sanitized: NodeJS.ProcessEnv,
+  spawnEnv: NodeJS.ProcessEnv | undefined,
+): NodeJS.ProcessEnv {
+  const cap = spawnEnv?.[CLAUDE_CODE_MAX_OUTPUT_TOKENS_ENV];
+  if (typeof cap === 'string' && cap !== '') sanitized[CLAUDE_CODE_MAX_OUTPUT_TOKENS_ENV] = cap;
+  return sanitized;
+}
+
 export function sanitizeEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const sanitized: NodeJS.ProcessEnv = {};
 

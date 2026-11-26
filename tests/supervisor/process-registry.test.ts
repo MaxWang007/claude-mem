@@ -440,6 +440,44 @@ describe('supervisor ProcessRegistry', () => {
       }
     });
 
+    it('gives the child an explicit output cap and still strips other CLAUDE_CODE_* values', async () => {
+      assertIsolatedObserverSessionsDir();
+      const sessionId = process.pid + 10007;
+      const cwd = path.join(OBSERVER_SESSIONS_DIR, String(sessionId));
+      tempDirs.push(cwd);
+      const previous = process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+      process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = '128000';
+      const probe = 'process.stdout.write(`${process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS ?? ""}|${process.env.CLAUDE_CODE_EFFORT_LEVEL ?? ""}`)';
+      const spawnAndRead = async (env?: NodeJS.ProcessEnv) => {
+        const result = spawnSdkProcess(sessionId, {
+          command: process.execPath,
+          args: ['--eval', probe],
+          ...(env ? { env } : {}),
+        });
+        expect(result).not.toBeNull();
+        try {
+          return (await new Response(result!.process.stdout).text()).trim();
+        } finally {
+          try { result!.process.kill('SIGKILL'); } catch { /* already exited */ }
+          await new Promise<void>(resolve => {
+            if (result!.process.exitCode !== null) resolve();
+            else result!.process.once('exit', () => resolve());
+          });
+        }
+      };
+      try {
+        expect(await spawnAndRead({
+          PATH: process.env.PATH,
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: '4096',
+          CLAUDE_CODE_EFFORT_LEVEL: 'high',
+        })).toBe('4096|');
+        expect(await spawnAndRead()).toBe('|');
+      } finally {
+        if (previous === undefined) delete process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+        else process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = previous;
+      }
+    });
+
     it('returns null when the observer session directory cannot be created', () => {
       assertIsolatedObserverSessionsDir();
       mkdirSync(OBSERVER_SESSIONS_DIR, { recursive: true });
